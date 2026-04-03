@@ -1,0 +1,39 @@
+name: Retrain
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [drift-detected]
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/catanrl-github-actions
+          aws-region: us-east-1
+      - name: Dispatch training
+        run: python scripts/dispatch_training.py --budget 50
+      - name: Evaluate and promote
+        run: python scripts/evaluate_and_promote.py --threshold 0.02
+      - name: Upload champion to S3
+        run: aws s3 cp models/champion.pt s3://catanrl-models/champion.pt
+      - name: Rolling deploy
+        run: |
+          aws ecs update-service \
+            --cluster catanrl \
+            --service catanrl-api \
+            --force-new-deployment
