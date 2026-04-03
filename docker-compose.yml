@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+    environment:
+      - MODEL_PATH=/app/models/champion.pt
+      - LOG_LEVEL=INFO
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      - mlflow
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+    command: mlflow server --host 0.0.0.0
+
+  drift_monitor:
+    build: .
+    command: python -m src.monitoring.drift_monitor --interval 21600
+    depends_on:
+      - api
