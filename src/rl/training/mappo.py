@@ -19,6 +19,9 @@ import torch.optim as optim
 
 from ..env.action_space import ActionSpace
 from ..env.catan_env import CatanEnv
+from ..eval.agents import HeuristicAgent, RandomAgent
+from ..eval.arena import Arena
+from ..eval.elo import EloTracker
 from ..models.gnn_encoder import CatanGNNEncoder
 from ..models.policy import CatanPolicy
 
@@ -52,6 +55,18 @@ class MAPPOConfig:
     log_interval: int = 10
     save_interval: int = 100
     checkpoint_dir: str = "models/checkpoints"
+
+    # Resume
+    resume_checkpoint: str | None = None
+
+    # Evaluation (arena + Elo)
+    eval_interval: int = 100        # run eval every N updates (aligned with save_interval)
+    eval_games: int = 50            # games per eval run
+    elo_path: str | None = None     # path to persist elo.json (e.g. /models/elo.json)
+
+    # League training — mix diverse opponents instead of pure self-play
+    # e.g. {"random": 0.4, "heuristic": 0.6}  None = pure self-play (old behaviour)
+    opponent_mix: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -165,12 +180,121 @@ class MAPPOTrainer:
         self.global_step = 0
         self.num_updates = 0
 
+        # Resume from checkpoint if specified
+        if config.resume_checkpoint:
+            self._load_checkpoint(config.resume_checkpoint)
+
+        # Evaluation
+        self.elo = EloTracker(save_path=config.elo_path)
+        self._games_completed: int = 0   # total episodes finished (for sample efficiency)
+
         # Per-env episode tracking
         self.episode_rewards = np.zeros(config.num_envs, dtype=np.float64)
         self.episode_lengths = np.zeros(config.num_envs, dtype=np.int64)
         self.completed_episode_rewards: list[float] = []
         self.completed_episode_lengths: list[int] = []
         self.completed_episode_wins: list[int] = []  # player index of winner
+
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
+
+    def _load_checkpoint(self, path: str) -> None:
+        """Load policy weights and training state from a checkpoint."""
+        ckpt = torch.load(path, map_location=self.device)
+        if isinstance(ckpt, dict) and "policy_state_dict" in ckpt:
+            self.policy.load_state_dict(ckpt["policy_state_dict"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.global_step = ckpt.get("global_step", 0)
+            self.num_updates = ckpt.get("num_updates", 0)
+        else:
+            # Legacy: bare state_dict saved before resume support was added
+            self.policy.load_state_dict(ckpt)
+            # Infer position from filename, e.g. policy_update_400.pt
+            import re
+            m = re.search(r"update_(\d+)", path)
+            if m:
+                self.num_updates = int(m.group(1))
+                batch_size = self.config.num_steps * self.config.num_envs
+                self.global_step = self.num_updates * batch_size
+        print(
+            f"[resume] Loaded checkpoint: {path} "
+            f"(update={self.num_updates}, step={self.global_step})"
+        )
+
+    def _save_checkpoint(self, update_idx: int) -> str:
+        """Save policy, optimizer, and training state to a checkpoint."""
+        ckpt_path = os.path.join(
+            self.config.checkpoint_dir, f"policy_update_{update_idx}.pt"
+        )
+        torch.save(
+            {
+                "policy_state_dict": self.policy.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "global_step": self.global_step,
+                "num_updates": update_idx,
+            },
+            ckpt_path,
+        )
+        return ckpt_path
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def _run_eval(self, update_idx: int, use_mlflow: bool) -> dict:
+        """Run arena evaluation vs random and heuristic baselines, update Elo."""
+        cfg = self.config
+        checkpoint_name = f"update_{update_idx}"
+        self.elo.register(checkpoint_name)
+
+        results = {}
+        for baseline_name, opponent in [
+            ("random", RandomAgent()),
+            ("heuristic", HeuristicAgent()),
+        ]:
+            arena = Arena(
+                policy=self.policy,
+                opponent=opponent,
+                device=str(self.device),
+                num_games=cfg.eval_games,
+                games_completed=self._games_completed,
+            )
+            r = arena.run()
+
+            elo_rating, _ = self.elo.update(
+                player_a=checkpoint_name,
+                player_b=baseline_name,
+                wins_a=r.wins,
+                wins_b=r.losses,
+                draws=r.draws,
+                global_step=self.global_step,
+            )
+            results[baseline_name] = r
+            print(
+                f"  [eval vs {baseline_name:9s}] "
+                f"W={r.wins} L={r.losses} D={r.draws} "
+                f"win_rate={r.win_rate:.3f}  "
+                f"elo={elo_rating:.1f}  "
+                f"games_completed={self._games_completed:,}"
+            )
+
+            if use_mlflow:
+                try:
+                    import mlflow
+                    mlflow.log_metrics(
+                        {
+                            f"win_rate_vs_{baseline_name}": r.win_rate,
+                            f"elo_vs_{baseline_name}": elo_rating,
+                            "games_completed": self._games_completed,
+                        },
+                        step=self.global_step,
+                    )
+                except Exception:
+                    pass
+
+        print(self.elo.summary())
+        return results
 
     # ------------------------------------------------------------------
     # Environment helpers
@@ -215,6 +339,158 @@ class MAPPOTrainer:
             torch.from_numpy(player_f).float().to(device),
             torch.from_numpy(cp).long().to(device),
             torch.from_numpy(masks).float().to(device),
+        )
+
+    # ------------------------------------------------------------------
+    # League training helpers
+    # ------------------------------------------------------------------
+
+    def _sample_opponent(self):
+        """Sample one opponent agent according to opponent_mix weights."""
+        mix = self.config.opponent_mix or {}
+        if not mix:
+            return None
+        names = list(mix.keys())
+        weights = np.array([mix[n] for n in names], dtype=np.float64)
+        weights /= weights.sum()
+        chosen = np.random.choice(names, p=weights)
+        if chosen == "heuristic":
+            return HeuristicAgent()
+        return RandomAgent()
+
+    def collect_rollout_league(self) -> RolloutBuffer:
+        """League-training rollout: training agent is always seat 0.
+
+        Opponent agents (random / heuristic) are advanced through their turns
+        automatically between each training-agent step. Only training-agent
+        transitions are added to the PPO buffer.
+        """
+        cfg = self.config
+        n_steps, n_envs = cfg.num_steps, cfg.num_envs
+        device = self.device
+        TRAINING_SEAT = 0
+
+        all_hex   = torch.zeros(n_steps, n_envs, 19, 9, device=device)
+        all_vert  = torch.zeros(n_steps, n_envs, 54, 3 + cfg.num_players, device=device)
+        all_edge  = torch.zeros(n_steps, n_envs, 72, 1 + cfg.num_players, device=device)
+        all_player = torch.zeros(n_steps, n_envs, cfg.num_players, 14, device=device)
+        all_cp     = torch.zeros(n_steps, n_envs, dtype=torch.long, device=device)
+        all_masks  = torch.zeros(n_steps, n_envs, ActionSpace.TOTAL_ACTIONS, device=device)
+        all_actions  = torch.zeros(n_steps, n_envs, dtype=torch.long, device=device)
+        all_logprobs = torch.zeros(n_steps, n_envs, device=device)
+        all_rewards  = torch.zeros(n_steps, n_envs, device=device)
+        all_dones    = torch.zeros(n_steps, n_envs, device=device)
+        all_values   = torch.zeros(n_steps, n_envs, device=device)
+
+        if not hasattr(self, "_current_obs"):
+            self._current_obs = self._reset_envs()
+        if not hasattr(self, "_env_opponents"):
+            self._env_opponents = [self._sample_opponent() for _ in range(n_envs)]
+
+        obs_list = self._current_obs
+        # Accumulated inter-step reward for each env (from opponent turns)
+        acc_rewards = np.zeros(n_envs, dtype=np.float64)
+
+        def _advance_opponents(i: int, obs: dict) -> tuple[dict, bool, dict]:
+            """Step env i through opponent turns until seat 0 or episode end."""
+            info: dict = {}
+            while int(obs["current_player"]) != TRAINING_SEAT:
+                action = self._env_opponents[i].act(obs)
+                obs, reward, terminated, truncated, info = self.envs[i].step(action)
+                acc_rewards[i] += reward
+                self.global_step += 1
+                if terminated or truncated:
+                    self.completed_episode_rewards.append(float(self.episode_rewards[i]))
+                    self.completed_episode_lengths.append(int(self.episode_lengths[i]))
+                    self.completed_episode_wins.append(info.get("winner", -1))
+                    self._games_completed += 1
+                    obs, _ = self.envs[i].reset()
+                    self.episode_rewards[i] = 0.0
+                    self.episode_lengths[i] = 0
+                    acc_rewards[i] = 0.0
+                    self._env_opponents[i] = self._sample_opponent()
+                    return obs, True, info
+            return obs, False, info
+
+        self.policy.eval()
+        with torch.no_grad():
+            for step in range(n_steps):
+                # Advance every env to training seat
+                for i in range(n_envs):
+                    obs_list[i], _, _ = _advance_opponents(i, obs_list[i])
+
+                hex_f, vert_f, edge_f, player_f, cp, masks = self._obs_to_tensors(obs_list)
+                all_hex[step]    = hex_f
+                all_vert[step]   = vert_f
+                all_edge[step]   = edge_f
+                all_player[step] = player_f
+                all_cp[step]     = cp
+                all_masks[step]  = masks
+
+                obs_dict = {
+                    "hex_features": hex_f, "vertex_features": vert_f,
+                    "edge_features": edge_f, "player_features": player_f,
+                    "current_player": cp,
+                }
+                actions, log_probs, _, values = self.policy.get_action_and_value(obs_dict, masks)
+                all_actions[step]  = actions
+                all_logprobs[step] = log_probs
+                all_values[step]   = values.squeeze(-1)
+
+                # Step training agent
+                actions_np = actions.cpu().numpy()
+                next_obs_list = []
+                for i, env in enumerate(self.envs):
+                    obs, reward, terminated, truncated, info = env.step(int(actions_np[i]))
+                    done = terminated or truncated
+                    total_reward = reward + float(acc_rewards[i])
+                    acc_rewards[i] = 0.0
+
+                    all_rewards[step, i] = total_reward
+                    all_dones[step, i]   = float(done)
+                    self.episode_rewards[i] += total_reward
+                    self.episode_lengths[i] += 1
+                    self.global_step += 1
+
+                    if done:
+                        self.completed_episode_rewards.append(float(self.episode_rewards[i]))
+                        self.completed_episode_lengths.append(int(self.episode_lengths[i]))
+                        self.completed_episode_wins.append(info.get("winner", -1))
+                        self._games_completed += 1
+                        obs, _ = env.reset()
+                        self.episode_rewards[i] = 0.0
+                        self.episode_lengths[i] = 0
+                        self._env_opponents[i] = self._sample_opponent()
+
+                    next_obs_list.append(obs)
+
+                obs_list = next_obs_list
+
+            # Bootstrap: advance to training seat for value estimate
+            for i in range(n_envs):
+                obs_list[i], _, _ = _advance_opponents(i, obs_list[i])
+
+            hex_f, vert_f, edge_f, player_f, cp, _ = self._obs_to_tensors(obs_list)
+            obs_dict = {
+                "hex_features": hex_f, "vertex_features": vert_f,
+                "edge_features": edge_f, "player_features": player_f,
+                "current_player": cp,
+            }
+            next_value = self.policy.get_value(obs_dict).squeeze(-1)
+
+        self._current_obs = obs_list
+
+        advantages, returns = compute_gae(
+            all_rewards, all_values, all_dones, next_value,
+            cfg.gamma, cfg.gae_lambda,
+        )
+        return RolloutBuffer(
+            hex_features=all_hex, vertex_features=all_vert,
+            edge_features=all_edge, player_features=all_player,
+            current_player=all_cp, action_masks=all_masks,
+            actions=all_actions, log_probs=all_logprobs,
+            rewards=all_rewards, dones=all_dones, values=all_values,
+            advantages=advantages, returns=returns,
         )
 
     # ------------------------------------------------------------------
@@ -296,6 +572,7 @@ class MAPPOTrainer:
                         self.completed_episode_rewards.append(float(self.episode_rewards[i]))
                         self.completed_episode_lengths.append(int(self.episode_lengths[i]))
                         self.completed_episode_wins.append(info.get("winner", -1))
+                        self._games_completed += 1
 
                         # Reset environment
                         obs, _ = env.reset()
@@ -519,12 +796,17 @@ class MAPPOTrainer:
         start_time = time.time()
         last_metrics: dict = {}
 
+        start_update = self.num_updates + 1
+
         try:
-            for update_idx in range(1, num_total_updates + 1):
+            for update_idx in range(start_update, num_total_updates + 1):
                 self.num_updates = update_idx
 
-                # Collect rollout
-                rollout = self.collect_rollout()
+                # Collect rollout (league or self-play)
+                if self.config.opponent_mix:
+                    rollout = self.collect_rollout_league()
+                else:
+                    rollout = self.collect_rollout()
 
                 # PPO update
                 update_metrics = self.update(rollout)
@@ -578,13 +860,13 @@ class MAPPOTrainer:
                         mlflow.log_metrics(all_metrics, step=self.global_step)
                         mlflow.log_metric("sps", sps, step=self.global_step)
 
-                # Checkpoint saving
+                # Checkpoint saving + eval
                 if update_idx % cfg.save_interval == 0:
-                    ckpt_path = os.path.join(
-                        cfg.checkpoint_dir, f"policy_update_{update_idx}.pt"
-                    )
-                    torch.save(self.policy.state_dict(), ckpt_path)
+                    ckpt_path = self._save_checkpoint(update_idx)
                     print(f"  -> Saved checkpoint: {ckpt_path}")
+
+                if update_idx % cfg.eval_interval == 0:
+                    self._run_eval(update_idx, use_mlflow)
 
         finally:
             if use_mlflow:
