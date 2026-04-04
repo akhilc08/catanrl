@@ -45,7 +45,7 @@ _volume = modal.Volume.from_name("catanrl-models", create_if_missing=False)
     volumes={"/models": _volume},
 )
 def run_eval(
-    checkpoint: str = "/models/checkpoints/policy_final.pt",
+    checkpoint: str = "/models/champion.pt",
     num_games: int = 200,
 ) -> dict:
     import sys
@@ -104,7 +104,7 @@ def run_eval(
 
 @app.local_entrypoint()
 def main(
-    checkpoint: str = "/models/checkpoints/policy_final.pt",
+    checkpoint: str = "/models/champion.pt",
     num_games: int = 200,
 ) -> None:
     results = run_eval.remote(checkpoint=checkpoint, num_games=num_games)
