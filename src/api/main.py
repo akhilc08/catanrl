@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 
 from .model_loader import ModelManager
 from .routes.feedback import router as feedback_router
+from .routes.game import router as game_router
 from .routes.health import router as health_router
 from .routes.predict import router as predict_router
 
@@ -59,3 +60,4 @@ async def request_middleware(request: Request, call_next):
 app.include_router(predict_router, tags=["inference"])
 app.include_router(health_router, tags=["health"])
 app.include_router(feedback_router, tags=["feedback"])
+app.include_router(game_router)
