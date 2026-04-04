@@ -25,12 +25,15 @@ Multi-agent reinforcement learning system for Settlers of Catan. A full producti
 
 CatanRL trains a 4-player Catan AI using Multi-Agent Proximal Policy Optimization (MAPPO) with self-play and curriculum scheduling. The trained policy is served via a FastAPI REST API deployed on AWS ECS Fargate. A background monitoring loop detects distribution drift in inference data and automatically triggers retraining via GitHub Actions.
 
+**74% win rate vs random · 52% vs rule-based agents (25% baseline) · autonomous UCB1 hyperparameter search · drift-triggered AWS ECS retraining**
+
 **Key design decisions:**
 
 - Heterogeneous Graph Attention Network encodes the board as a typed graph (hexes, vertices, edges) rather than a flat feature vector
 - Flat integer action space (261 actions) with boolean masking enforces legal moves without any special-casing in the policy
 - Champion/challenger promotion pattern gates every model version before it reaches production
 - Drift-triggered retraining closes the loop between production observations and training data
+- Autonomous research agent uses UCB1 bandit selection to propose hyperparameter mutations, run self-play trials, and promote configs that improve win rate — continuously discovering better training configurations without manual tuning
 
 ---
 
