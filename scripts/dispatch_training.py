@@ -48,10 +48,10 @@ if _MODAL_AVAILABLE:
             ),
         )
         .pip_install(
+            "numpy>=1.24.0,<2.0",  # torch 2.1.0 is not compatible with numpy 2.x
             "mlflow>=2.9.0",
             "structlog>=23.2.0",
             "scipy>=1.11.0",
-            "numpy>=1.24.0",
             "gymnasium>=0.29.0",
         )
         .add_local_dir("src", remote_path="/app/src", copy=True)
@@ -72,6 +72,8 @@ if _MODAL_AVAILABLE:
         num_steps: int = 128,
         log_interval: int = 10,
         save_interval: int = 100,
+        resume_from: str | None = None,
+        league: bool = False,
     ) -> dict:
         """Training function that runs inside the Modal container on GPU."""
         import sys
@@ -99,6 +101,9 @@ if _MODAL_AVAILABLE:
             checkpoint_dir="/models/checkpoints",
             log_interval=log_interval,
             save_interval=save_interval,
+            resume_checkpoint=resume_from,
+            elo_path="/models/elo.json",
+            opponent_mix={"random": 0.4, "heuristic": 0.6} if league else None,
         )
 
         encoder = CatanGNNEncoder.from_env_defaults()
@@ -130,6 +135,8 @@ if _MODAL_AVAILABLE:
         timesteps: int = 2_000_000,
         num_envs: int = 16,
         lr: float = 3e-4,
+        resume_from: str = "",
+        league: bool = False,
     ) -> None:
         """
         Entrypoint used by `modal run scripts/dispatch_training.py`.
@@ -137,15 +144,21 @@ if _MODAL_AVAILABLE:
         Override defaults:
             modal run scripts/dispatch_training.py --timesteps 5000000
             modal run scripts/dispatch_training.py --num-envs 32
+            modal run scripts/dispatch_training.py --resume-from /models/checkpoints/policy_update_400.pt
         """
+        resume = resume_from or None
         print(
             f"[dispatch] timesteps={timesteps:,}  "
             f"num_envs={num_envs}  lr={lr}  gpu=A10G"
+            f"  league={league}"
+            + (f"  resume={resume}" if resume else "")
         )
         metrics = train_remote.remote(
             total_timesteps=timesteps,
             num_envs=num_envs,
             learning_rate=lr,
+            resume_from=resume,
+            league=league,
         )
         print("\n[dispatch] Training complete.")
         print(json.dumps(metrics, indent=2, default=str))
